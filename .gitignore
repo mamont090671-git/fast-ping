@@ -1,0 +1,6 @@
+# Build artifacts
+fast-ping
+*.o
+
+# IDE
+.vscode/

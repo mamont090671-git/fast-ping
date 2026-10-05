@@ -6,20 +6,18 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <arpa/inet.h>
+#include <netinet/in.h>
 #include <netdb.h>
 
 typedef struct {
     char *ip;
     int count;
     int lang;
-    int thread_id;
     int is_valid;
     int success;
 } PingTask;
 
 volatile sig_atomic_t cancelled = 0;
-int total_threads = 0;
-int completed_threads = 0;
 
 static void signal_handler(int sig) {
     cancelled = 1;
@@ -40,6 +38,7 @@ const char *lang_error[] = {"[ ERROR   ]", "[ ERROR   ]"};
 const char *lang_usage[] = {"Usage: %s -c <packets> <ip1> <ip2> ...", "Использование: %s -c <кол-во пакетов> <ip1> <ip2> ..."};
 const char *lang_rtt[] = {"RTT (ms): ", "RTT (ms): "};
 const char *lang_unavailable[] = {"Unavailable", "Недоступен"};
+const char *lang_dns_fail[] = {"DNS resolution failed", "ошибка разрешения DNS"};
 const char *lang_popen_error[] = {"Error popen", "Ошибка popen"};
 const char *lang_thread_error[] = {"Error creating thread for %s", "Ошибка создания потока для %s"};
 const char *lang_interrupted[] = {"\n\nInterrupted by user\n", "\n\nПрервано пользователем\n"};
@@ -60,7 +59,7 @@ void* ping_ip(void* arg) {
     } else {
         // Это доменное имя, пробуем разрешить
         if (resolve_hostname(task->ip, ip_or_host, sizeof(ip_or_host)) != 0) {
-            printf("\033[0;31m%s\033[0m %-15s | DNS resolution failed\n", lang_error[task->lang], task->ip);
+            printf("\033[0;31m%s\033[0m %-15s | %s\n", lang_error[task->lang], task->ip, lang_dns_fail[task->lang]);
             task->is_valid = 0;
             task->success = 0;
             return NULL;
@@ -77,19 +76,16 @@ void* ping_ip(void* arg) {
         return NULL;
     }
     
-     int packets_sent = 0;
-    int packets_received = 0;
+     int packets_received = 0;
     int ping_success = 0;
-    int rtt_found = 0;
     
     while (fgets(buffer, sizeof(buffer), fp) != NULL) {
         // Поиск строки с RTT
         if (strstr(buffer, "rtt") || strstr(buffer, "round-trip")) {
             task->is_valid = 1;
-            rtt_found = 1;
             char *start = strchr(buffer, '=');
             if (start) {
-                strncpy(latency_info, start + 2, sizeof(latency_info) - 1);
+                strncpy(latency_info, start + 1, sizeof(latency_info) - 1);
                 latency_info[sizeof(latency_info) - 1] = '\0';
                 
                 // Удаляем начальные пробелы
@@ -110,32 +106,19 @@ void* ping_ip(void* arg) {
             }
         }
         
-        // Парсинг статистики ping
-        if (strstr(buffer, "packets transmitted") && strstr(buffer, " received")) {
-            char *trans = strstr(buffer, "packets transmitted");
-            char *rec = strstr(buffer, " received");
-            // Извлекаем число из строки "X packets transmitted, Y received"
-            char *end_trans = strchr(trans, ',');
-            if (end_trans) {
-                *end_trans = '\0';
-            }
-            char *end_rec = strchr(rec, ',');
-            if (end_rec) {
-                *end_rec = '\0';
-            }
-            packets_sent = atoi(trans);
-            packets_received = atoi(rec);
-            if (packets_sent > 0 && packets_received == packets_sent) {
-                ping_success = 1;
-            }
-        }
+        // Парсинг статистики ping: "N packets transmitted, M received"
+        int sent;
+        sscanf(buffer, "%d packets transmitted, %d received", &sent, &packets_received);
+        (void)sent;
     }
     
-    // Если не смогли распарсить статистику, используем exit code
     int status = pclose(fp);
-    if (!ping_success && WIFEXITED(status)) {
-        int exit_code = WEXITSTATUS(status);
-        ping_success = (exit_code == 0);
+    // При частичной потере (1 из 3 доставлено) ping завершается с 1,
+    // но хост доступен — по доставленным пакетам честнее, чем по exit code
+    if (packets_received > 0) {
+        ping_success = 1;
+    } else if (!ping_success && WIFEXITED(status)) {
+        ping_success = (WEXITSTATUS(status) == 0);
     }
     task->success = ping_success;
     
@@ -148,9 +131,6 @@ void* ping_ip(void* arg) {
         }
     }
     
-    // Атомарное обновление счетчика завершенных
-    __sync_fetch_and_add(&completed_threads, 1);
-    
     return NULL;
 }
 
@@ -160,25 +140,18 @@ int is_valid_ip(const char *ip) {
 }
 
 int resolve_hostname(const char *hostname, char *ip_buffer, size_t buffer_size) {
-    struct hostent *he;
-    struct in_addr **addr_list;
-    int i;
+    struct addrinfo hints = {0}, *res;  /* memset — ai_flags не должен быть мусором со стека */
+    hints.ai_family = AF_INET;   /* ponytail: только IPv4, AF_UNSPEC если нужен IPv6 */
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
 
-    he = gethostbyname(hostname);
-    if (he == NULL) {
-        return -1; // DNS lookup failed
+    if (getaddrinfo(hostname, NULL, &hints, &res) != 0) {
+        return -1;
     }
-
-    addr_list = (struct in_addr **)he->h_addr_list;
-    for (i = 0; addr_list[i] != NULL; i++) {
-        if (inet_ntoa(*addr_list[i]) != NULL) {
-            strncpy(ip_buffer, inet_ntoa(*addr_list[i]), buffer_size - 1);
-            ip_buffer[buffer_size - 1] = '\0';
-            return 0;
-        }
-    }
-
-    return -1;
+    struct sockaddr_in *addr = (struct sockaddr_in *)res->ai_addr;
+    inet_ntop(AF_INET, &addr->sin_addr, ip_buffer, buffer_size);
+    freeaddrinfo(res);
+    return 0;
 }
 
 int main(int argc, char *argv[]) {
@@ -228,11 +201,9 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     
-    total_threads = num_ips;
-    completed_threads = 0;
-    
     pthread_t threads[num_ips];
     PingTask tasks[num_ips];
+    int created = 0;  /* сколько потоков реально создано — для cancel при Ctrl+C */
     
     printf("\n%-11s %-15s | %s\n", lang_status[lang], lang_ip[lang], lang_time[lang]);
     printf("------------------------------------------------------------\n");
@@ -241,30 +212,34 @@ int main(int argc, char *argv[]) {
         tasks[i].ip = argv[arg_start + i];
         tasks[i].count = packet_count;
         tasks[i].lang = lang;
-        tasks[i].thread_id = i;
         tasks[i].is_valid = -1;
         tasks[i].success = 0;
         
         if (pthread_create(&threads[i], NULL, ping_ip, &tasks[i]) != 0) {
             fprintf(stderr, lang_thread_error[lang], tasks[i].ip);
+            for (int j = 0; j < created; j++) {
+                pthread_cancel(threads[j]);
+                pthread_join(threads[j], NULL);
+            }
             return 1;
         }
+        created++;
     }
     
     if (cancelled) {
         fprintf(stdout, "%s", lang_interrupted[lang]);
-        for (int i = 0; i < num_ips; i++) {
+        for (int i = 0; i < created; i++) {
             pthread_cancel(threads[i]);
             pthread_join(threads[i], NULL);
         }
         return 1;
     }
     
-    for (int i = 0; i < num_ips; i++) {
+    for (int i = 0; i < created; i++) {
         pthread_join(threads[i], NULL);
     }
     
-    for (int i = 0; i < num_ips; i++) {
+    for (int i = 0; i < created; i++) {
         if (tasks[i].is_valid == 1) {
             if (tasks[i].success) success_count++;
             else failed_count++;
