@@ -1,6 +1,10 @@
 # Build artifacts
 fast-ping
+fast_ping
+fp
+fp_dbg*
 *.o
+*.bak.*
 
 # IDE
 .vscode/
